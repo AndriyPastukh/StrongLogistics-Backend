@@ -1,0 +1,12 @@
+django
+djangorestframework
+djangorestframework-simplejwt
+django-cors-headers
+ortools
+geopy
+requests
+python-dotenv
+
+django-filter
+
+reportlab
