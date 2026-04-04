@@ -97,5 +97,3 @@ python manage.py runserver
 3. **Verify Results**: Check the rich route response containing step-by-step coordinates.
 4. **Complete Cycle**: Call `complete_order` to see warehouse inventory update in real-time.
 
----
-*Developed for the StrongLogistics Hackathon 2026.*
