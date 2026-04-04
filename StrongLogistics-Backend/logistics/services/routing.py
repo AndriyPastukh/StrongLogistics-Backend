@@ -1,162 +1,253 @@
-import numpy as np
 from ortools.constraint_solver import routing_enums_pb2
 from ortools.constraint_solver import pywrapcp
-from geopy.distance import geodesic
-from ..models import Location, Vehicle, Order
+import time
+import math
+from typing import List, Optional
+from dataclasses import dataclass, field
+from django.conf import settings
+
+# --- Data Models (Internal for the solver) ---
+
+class NodeType:
+    DEPOT = "warehouse"
+    SUPPLIER = "supplier"
+    DELIVERY_POINT = "customer"
+    HOTSPOT = "hotspot"
+
+@dataclass
+class SolverLocation:
+    id: int
+    name: str
+    lat: float
+    lng: float
+    type: str
+    service_time_sec: float = 0.0
+    time_window_start: Optional[float] = None
+    time_window_end: Optional[float] = None
+
+@dataclass
+class SolverOrder:
+    id: int
+    from_location_id: int  # Pickup
+    to_location_id: int    # Delivery
+    volume: float
+    weight: float = 0.0
+    priority: int = 1
+    time_window_start: Optional[float] = None
+    time_window_end: Optional[float] = None
+
+@dataclass
+class SolverVehicle:
+    id: int
+    start_depot_id: int
+    end_depot_id: int
+    capacity: float
+    weight_capacity: float
+    max_distance: float
+    cost_per_km: float = 1.0
+
+# --- The Optimizer Engine ---
 
 class RouteOptimizer:
-    def __init__(self, vehicles, orders, depot_location):
+    def __init__(self, vehicles, orders, locations):
         self.vehicles = vehicles
         self.orders = orders
-        self.depot = depot_location
-        # Depot is the first location
-        self.locations = [depot_location] + [order.destination for order in orders]
-        self.num_vehicles = len(vehicles)
-        self.depot_index = 0
+        self.locations = locations
+        
+        # Map location ID -> index for OR-Tools
+        self.id_to_idx = {loc.id: i for i, loc in enumerate(locations)}
+        
+    def _haversine(self, lat1, lon1, lat2, lon2):
+        R = 6371.0  # Earth radius in km
+        dlat = math.radians(lat2 - lat1)
+        dlon = math.radians(lon2 - lon1)
+        a = math.sin(dlat / 2)**2 + math.cos(math.radians(lat1)) * \
+            math.cos(math.radians(lat2)) * math.sin(dlon / 2)**2
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+        return R * c
 
-    def _create_distance_matrix(self):
-        size = len(self.locations)
-        matrix = np.zeros((size, size))
-        for i in range(size):
-            for j in range(size):
-                if i == j:
-                    matrix[i][j] = 0
-                else:
-                    loc1 = (self.locations[i].latitude, self.locations[i].longitude)
-                    loc2 = (self.locations[j].latitude, self.locations[j].longitude)
-                    # Use meters for integer precision required by OR-Tools
-                    matrix[i][j] = int(geodesic(loc1, loc2).meters)
-        return matrix.tolist()
-
-    def optimize(self):
-        if not self.orders or not self.vehicles:
-            return {"error": "No orders or vehicles provided"}
-
-        data = {}
-        data['distance_matrix'] = self._create_distance_matrix()
-        # Demand is the sum of items in each order. Depot has 0 demand.
-        data['demands'] = [0] + [sum(item.quantity for item in order.items.all()) for order in self.orders]
-        data['vehicle_capacities'] = [int(v.capacity) for v in self.vehicles]
-        data['num_vehicles'] = len(self.vehicles)
-        data['depot'] = self.depot_index
-
-        # Add penalties for prioritizing critical orders
-        # Penalty = huge for critical, large for high, medium for normal
-        penalty_vals = {'critical': 1000000, 'high': 100000, 'normal': 10000}
-        data['penalties'] = [penalty_vals.get(order.priority, 10000) for order in self.orders]
-
-        manager = pywrapcp.RoutingIndexManager(len(data['distance_matrix']),
-                                              data['num_vehicles'], data['depot'])
+    def optimize(self, time_limit=10):
+        # 1. Setup Data
+        num_locations = len(self.locations)
+        num_vehicles = len(self.vehicles)
+        
+        starts = [self.id_to_idx[v.start_depot_id] for v in self.vehicles]
+        ends = [self.id_to_idx[v.end_depot_id] for v in self.vehicles]
+        
+        manager = pywrapcp.RoutingIndexManager(num_locations, num_vehicles, starts, ends)
         routing = pywrapcp.RoutingModel(manager)
 
-        def distance_callback(from_index, to_index):
-            from_node = manager.IndexToNode(from_index)
-            to_node = manager.IndexToNode(to_index)
-            return data['distance_matrix'][from_node][to_node]
+        # 2. Distance Matrix & Cost
+        def distance_callback(from_idx, to_idx):
+            from_node = manager.IndexToNode(from_idx)
+            to_node = manager.IndexToNode(to_idx)
+            loc1 = self.locations[from_node]
+            loc2 = self.locations[to_node]
+            dist = self._haversine(loc1.lat, loc1.lng, loc2.lat, loc2.lng)
+            return int(dist * 1000)  # In meters
 
         transit_callback_index = routing.RegisterTransitCallback(distance_callback)
         routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
 
-        def demand_callback(from_index):
-            from_node = manager.IndexToNode(from_index)
-            return data['demands'][from_node]
+        # 3. Pickup and Delivery
+        for order in self.orders:
+            pickup_idx = manager.NodeToIndex(self.id_to_idx[order.from_location_id])
+            delivery_idx = manager.NodeToIndex(self.id_to_idx[order.to_location_id])
+            routing.AddPickupAndDelivery(pickup_idx, delivery_idx)
+            routing.solver().Add(routing.VehicleVar(pickup_idx) == routing.VehicleVar(delivery_idx))
+            
+            # Sequence: Pickup before delivery
+            # (Actually OR-Tools does this automatically with AddPickupAndDelivery, 
+            # but we can enforce it strictly if needed via dimensions)
 
-        demand_callback_index = routing.RegisterUnaryTransitCallback(demand_callback)
-        routing.AddDimensionWithVehicleCapacity(
-            demand_callback_index,
-            0,  # null capacity slack
-            data['vehicle_capacities'],  # vehicle maximum capacities
-            True,  # start cumul to zero
-            'Capacity')
-
-        # Add disjunctions (penalties for missing orders)
-        # We match node index (1 to N) with penalty index (0 to N-1)
-        for i in range(1, len(data['distance_matrix'])):
-            routing.AddDisjunction([manager.NodeToIndex(i)], data['penalties'][i-1])
-
-        search_parameters = pywrapcp.DefaultRoutingSearchParameters()
-        search_parameters.first_solution_strategy = (
-            routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC)
-        search_parameters.local_search_metaheuristic = (
-            routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH)
-        search_parameters.time_limit.seconds = 10
-
-        solution = routing.SolveWithParameters(search_parameters)
-
-        if solution:
-            return self._format_solution(data, manager, routing, solution)
-        else:
-            return {"error": "No solution found"}
-
-    def _format_solution(self, data, manager, routing, solution):
-        result = {"routes": []}
-        total_distance = 0
-        total_load = 0
+        # 4. Dimensions (Capacity, Weight, Distance, Time)
         
-        for vehicle_id in range(data['num_vehicles']):
-            index = routing.Start(vehicle_id)
+        # 4.1 Volume (Capacity)
+        demands = [0] * num_locations
+        for order in self.orders:
+            demands[self.id_to_idx[order.from_location_id]] += order.volume
+            demands[self.id_to_idx[order.to_location_id]] -= order.volume
+
+        def demand_callback(from_idx):
+            return int(demands[manager.IndexToNode(from_idx)] * 100)
+            
+        demand_idx = routing.RegisterUnaryTransitCallback(demand_callback)
+        routing.AddDimensionWithVehicleCapacity(
+            demand_idx, 0, [int(v.capacity * 100) for v in self.vehicles], True, "Capacity"
+        )
+
+        # 4.2 Weight
+        weights = [0] * num_locations
+        for order in self.orders:
+            weights[self.id_to_idx[order.from_location_id]] += order.weight
+            weights[self.id_to_idx[order.to_location_id]] -= order.weight
+
+        def weight_callback(from_idx):
+            return int(weights[manager.IndexToNode(from_idx)] * 100)
+            
+        weight_idx = routing.RegisterUnaryTransitCallback(weight_callback)
+        routing.AddDimensionWithVehicleCapacity(
+            weight_idx, 0, [int(v.weight_capacity * 100) for v in self.vehicles], True, "Weight"
+        )
+
+        # 4.3 Distance (Max range)
+        routing.AddDimension(transit_callback_index, 0, 10000000, True, "Distance")
+        distance_dim = routing.GetDimensionOrDie("Distance")
+        for i, v in enumerate(self.vehicles):
+            distance_dim.CumulVar(routing.End(i)).SetMax(int(v.max_distance * 1000))
+
+        # 4.4 Time Windows
+        def time_callback(from_idx, to_idx):
+            f_node = manager.IndexToNode(from_idx)
+            t_node = manager.IndexToNode(to_idx)
+            l1, l2 = self.locations[f_node], self.locations[t_node]
+            # Assumed speed 50 km/h = 13.8 m/s
+            dist_m = self._haversine(l1.lat, l1.lng, l2.lat, l2.lng) * 1000
+            travel_sec = dist_m / 13.88
+            return int(travel_sec + l1.service_time_sec)
+
+        time_idx = routing.RegisterTransitCallback(time_callback)
+        routing.AddDimension(time_idx, 86400, 86400 * 7, False, "Time")
+        time_dim = routing.GetDimensionOrDie("Time")
+        
+        # Set time windows for locations
+        for i, loc in enumerate(self.locations):
+            if loc.time_window_start is not None or loc.time_window_end is not None:
+                start = int(loc.time_window_start or 0)
+                end = int(loc.time_window_end or 86400 * 7)
+                time_dim.CumulVar(manager.NodeToIndex(i)).SetRange(start, end)
+        
+        # Set time windows for order deliveries
+        for order in self.orders:
+            if order.time_window_start is not None or order.time_window_end is not None:
+                d_idx = manager.NodeToIndex(self.id_to_idx[order.to_location_id])
+                start = int(order.time_window_start or 0)
+                end = int(order.time_window_end or 86400 * 7)
+                time_dim.CumulVar(d_idx).SetRange(start, end)
+
+        # 5. Disjunctions (Dropped orders with penalty)
+        for order in self.orders:
+            p_idx = manager.NodeToIndex(self.id_to_idx[order.from_location_id])
+            d_idx = manager.NodeToIndex(self.id_to_idx[order.to_location_id])
+            penalty = order.priority * 1000000
+            if p_idx != -1: routing.AddDisjunction([p_idx], penalty)
+            if d_idx != -1: routing.AddDisjunction([d_idx], penalty)
+
+        # 6. Solve
+        params = pywrapcp.DefaultRoutingSearchParameters()
+        params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+        params.time_limit.FromSeconds(time_limit)
+        
+        solution = routing.SolveWithParameters(params)
+        if solution:
+            return self._format_solution(manager, routing, solution)
+        return {"error": "No solution found"}
+
+    def _format_solution(self, manager, routing, solution):
+        result = {"routes": [], "total_distance_meters": 0}
+        total_dist = 0
+        
+        time_dim = routing.GetDimensionOrDie("Time")
+        dist_dim = routing.GetDimensionOrDie("Distance")
+
+        for v_idx, vehicle in enumerate(self.vehicles):
+            index = routing.Start(v_idx)
             route = {
-                "vehicle_id": self.vehicles[vehicle_id].id,
-                "vehicle_name": self.vehicles[vehicle_id].name,
+                "vehicle_id": vehicle.id,
                 "steps": [],
-                "route_coordinates": [], # [[lat, lng], [lat, lng]...]
-                "distance_meters": 0,
-                "load": 0
+                "route_coordinates": [],
+                "distance_meters": 0
             }
-            route_distance = 0
-            route_load = 0
             
             while not routing.IsEnd(index):
-                node_index = manager.IndexToNode(index)
-                route_load += data['demands'][node_index]
-                loc = self.locations[node_index]
+                node_idx = manager.IndexToNode(index)
+                loc = self.locations[node_idx]
                 
-                step_type = "pickup" if node_index == 0 else "delivery"
+                # Identify if this is a pickup or delivery
+                o_id = None
+                s_type = "depot"
+                if loc.type == NodeType.SUPPLIER: s_type = "pickup"
+                elif loc.type == NodeType.DELIVERY_POINT: s_type = "delivery"
                 
-                route['steps'].append({
-                    "type": step_type,
-                    "location_name": loc.name,
-                    "coords": [loc.latitude, loc.longitude],
-                    "order_id": self.orders[node_index-1].id if node_index > 0 else None,
-                    "priority": self.orders[node_index-1].priority if node_index > 0 else None
-                })
-                
-                route['route_coordinates'].append([loc.latitude, loc.longitude])
-                
-                previous_index = index
-                index = solution.Value(routing.NextVar(index))
-                route_distance += routing.GetArcCostForVehicle(previous_index, index, vehicle_id)
+                for o in self.orders:
+                    if s_type == "pickup" and o.from_location_id == loc.id: o_id = o.id
+                    if s_type == "delivery" and o.to_location_id == loc.id: o_id = o.id
 
-            # Add final depot return
-            node_index = manager.IndexToNode(index)
-            loc = self.locations[node_index]
+                route['steps'].append({
+                    "type": s_type,
+                    "location_name": loc.name,
+                    "coords": [loc.lat, loc.lng],
+                    "order_id": o_id,
+                    "arrival_time_sec": solution.Value(time_dim.CumulVar(index))
+                })
+                route['route_coordinates'].append([loc.lat, loc.lng])
+                index = solution.Value(routing.NextVar(index))
+
+            # Final depot
+            node_idx = manager.IndexToNode(index)
+            loc = self.locations[node_idx]
+            final_dist = solution.Value(dist_dim.CumulVar(index))
+            total_dist += final_dist
+            
             route['steps'].append({
                 "type": "return",
                 "location_name": loc.name,
-                "coords": [loc.latitude, loc.longitude],
+                "coords": [loc.lat, loc.lng],
                 "order_id": None,
-                "priority": None
+                "arrival_time_sec": solution.Value(time_dim.CumulVar(index))
             })
-            route['route_coordinates'].append([loc.latitude, loc.longitude])
-            
-            route['distance_meters'] = route_distance
-            route['load'] = route_load
+            route['route_coordinates'].append([loc.lat, loc.lng])
+            route['distance_meters'] = final_dist
             result['routes'].append(route)
-            
-            total_distance += route_distance
-            total_load += route_load
 
-        result['total_distance_meters'] = total_distance
-        result['total_load'] = total_load
+        result['total_distance_meters'] = total_dist
         
-        # Track dropped orders
-        dropped_orders = []
-        for node in range(1, len(data['distance_matrix'])):
-            if solution.Value(routing.NextVar(manager.NodeToIndex(node))) == manager.NodeToIndex(node):
-                dropped_orders.append({
-                    "order_id": self.orders[node-1].id,
-                    "priority": self.orders[node-1].priority
-                })
-        result['dropped_orders'] = dropped_orders
-
+        # Dropped orders
+        dropped = []
+        for o in self.orders:
+            p_idx = manager.NodeToIndex(self.id_to_idx[o.from_location_id])
+            if solution.Value(routing.NextVar(p_idx)) == p_idx:
+                dropped.append(o.id)
+        result['dropped_orders'] = dropped
+        
         return result

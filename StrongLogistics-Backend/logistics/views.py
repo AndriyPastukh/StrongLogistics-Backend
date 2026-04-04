@@ -3,7 +3,8 @@ from django.db import transaction
 from django.db.models import Count, Q, Sum
 from django.http import FileResponse
 from rest_framework import viewsets, status, views, serializers
-from rest_framework.decorators import action
+from rest_framework.decorators import action, permission_classes
+from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
@@ -147,28 +148,65 @@ class OrderViewSet(viewsets.ModelViewSet):
         return Response(self.get_serializer(order).data)
 
     @action(detail=False, methods=['post'])
+    @permission_classes([AllowAny])
     def auto_assign(self, request):
-        """Trigger CVRP and update order statuses with vehicle/warehouse assignments."""
+        """Trigger Advanced CVRP with weight/time constraints and pickup-delivery pairs."""
+        from .services.routing import SolverLocation, SolverOrder, SolverVehicle, RouteOptimizer
+        
         pending_orders = Order.objects.filter(status='pending')
         vehicles = Vehicle.objects.all()
+        locations = Location.objects.all()
         depot = Location.objects.filter(location_type='warehouse').first()
 
         if not depot:
-            return Response({"error": "No warehouse available"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"error": "No warehouse available as depot"}, status=status.HTTP_400_BAD_REQUEST)
 
-        optimizer = RouteOptimizer(list(vehicles), list(pending_orders), depot)
+        # 1. Map Models -> Solver Objects
+        s_locations = [
+            SolverLocation(
+                id=loc.id, name=loc.name, lat=loc.latitude, lng=loc.longitude, 
+                type=loc.location_type, service_time_sec=loc.service_time_sec,
+                time_window_start=loc.time_window_start, time_window_end=loc.time_window_end
+            ) for loc in locations
+        ]
+        
+        s_vehicles = [
+            SolverVehicle(
+                id=v.id, start_depot_id=v.start_depot.id if v.start_depot else depot.id,
+                end_depot_id=v.end_depot.id if v.end_depot else depot.id,
+                capacity=v.capacity, weight_capacity=v.weight_capacity,
+                max_distance=100.0, # Default max distance
+                cost_per_km=v.cost_per_km
+            ) for v in vehicles
+        ]
+        
+        s_orders = [
+            SolverOrder(
+                id=o.id, 
+                from_location_id=o.assigned_warehouse.id if o.assigned_warehouse else depot.id,
+                to_location_id=o.destination.id,
+                volume=sum(item.quantity for item in o.items.all()),
+                weight=o.weight,
+                priority=3 if o.priority == 'critical' else (2 if o.priority == 'high' else 1),
+                time_window_start=o.time_window_start,
+                time_window_end=o.time_window_end
+            ) for o in pending_orders
+        ]
+
+        # 2. Optimize
+        optimizer = RouteOptimizer(s_vehicles, s_orders, s_locations)
         result = optimizer.optimize()
 
         if 'error' in result:
              return Response(result, status=status.HTTP_400_BAD_REQUEST)
 
-        for route in result.get('routes', []):
-            vehicle = Vehicle.objects.get(id=route['vehicle_id'])
-            for step in route['steps']:
-                if step['order_id']:
+        # 3. Update Statuses & Assignments
+        for route_data in result.get('routes', []):
+            vehicle = Vehicle.objects.get(id=route_data['vehicle_id'])
+            for step in route_data['steps']:
+                if step.get('order_id') and step.get('type') == 'delivery':
                      Order.objects.filter(id=step['order_id']).update(
                          status='assigned',
-                         assigned_warehouse=depot,
                          assigned_vehicle=vehicle
                      )
 

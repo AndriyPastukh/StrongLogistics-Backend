@@ -14,25 +14,28 @@ class InventorySerializer(serializers.ModelSerializer):
         fields = ['id', 'location', 'material', 'material_name', 'quantity']
 
 class LocationSerializer(serializers.ModelSerializer):
-    inventory = InventorySerializer(many=True, read_only=True)
-    
     class Meta:
         model = Location
-        fields = ['id', 'name', 'location_type', 'latitude', 'longitude', 'inventory']
+        fields = ['id', 'name', 'latitude', 'longitude', 'location_type', 'service_time_sec', 'time_window_start', 'time_window_end']
 
 class VehicleSerializer(serializers.ModelSerializer):
     location_name = serializers.ReadOnlyField(source='current_location.name')
     
     class Meta:
         model = Vehicle
-        fields = ['id', 'name', 'capacity', 'current_location', 'location_name', 'last_lat', 'last_lng', 'is_online']
+        fields = [
+            'id', 'name', 'capacity', 'weight_capacity', 'current_location', 
+            'location_name', 'start_depot', 'end_depot', 'last_lat', 
+            'last_lng', 'is_online', 'cost_per_km'
+        ]
 
 class OrderItemSerializer(serializers.ModelSerializer):
     material_name = serializers.ReadOnlyField(source='material.name')
-    
+    unit = serializers.ReadOnlyField(source='material.unit')
+
     class Meta:
         model = OrderItem
-        fields = ['id', 'order', 'material', 'material_name', 'quantity']
+        fields = ['id', 'material', 'material_name', 'quantity', 'unit']
 
 class OrderSerializer(serializers.ModelSerializer):
     items = OrderItemSerializer(many=True, read_only=True)
@@ -42,4 +45,10 @@ class OrderSerializer(serializers.ModelSerializer):
     
     class Meta:
         model = Order
-        fields = ['id', 'created_at', 'destination', 'destination_name', 'assigned_warehouse', 'assigned_warehouse_name', 'assigned_vehicle', 'assigned_vehicle_name', 'priority', 'status', 'items']
+        fields = [
+            'id', 'created_at', 'destination', 'destination_name', 
+            'assigned_warehouse', 'assigned_warehouse_name', 
+            'assigned_vehicle', 'assigned_vehicle_name', 
+            'priority', 'status', 'weight', 'time_window_start', 
+            'time_window_end', 'items'
+        ]

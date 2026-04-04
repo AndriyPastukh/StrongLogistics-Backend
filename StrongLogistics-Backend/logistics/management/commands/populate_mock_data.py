@@ -3,7 +3,7 @@ from logistics.models import Material, Location, Inventory, Vehicle, Order, Orde
 import random
 
 class Command(BaseCommand):
-    help = 'Populates the database with realistic mock data for testing logistics system'
+    help = 'Populates the database with realistic mock data for testing advanced logistics V4'
 
     def handle(self, *args, **options):
         self.stdout.write(self.style.WARNING('Clearing existing data...'))
@@ -17,89 +17,105 @@ class Command(BaseCommand):
         # 1. Create Materials
         self.stdout.write('Creating materials...')
         materials = [
-            Material.objects.create(name='Water'),
-            Material.objects.create(name='Food Rations'),
-            Material.objects.create(name='Medical Supplies'),
+            Material.objects.create(name="Concrete Blocks", unit="pallet"),
+            Material.objects.create(name="Steel Rebar", unit="ton"),
+            Material.objects.create(name="Glass Panels", unit="box"),
+            Material.objects.create(name="Medical Supplies", unit="crate")
         ]
 
         # 2. Create Locations
         self.stdout.write('Creating locations...')
-        # Depot in Stryi, Ukraine (Strategic Logistics hub)
-        depot = Location.objects.create(
-            name='Central Depot - Stryi',
-            location_type='warehouse',
-            latitude=49.2558,
-            longitude=23.8510
+        
+        # Central Hub
+        hub = Location.objects.create(
+            name="Main Logistics Hub (Kyiv)", 
+            latitude=50.4501, longitude=30.5234, 
+            location_type='warehouse', 
+            service_time_sec=600
         )
-
-        # 7 Dropoff points around Stryi/Lviv region
-        dropoffs = []
-        dropoff_data = [
-            ("Lviv Regional Point", 49.8397, 24.0297),
-            ("Drogobych Hub", 49.3508, 23.5061),
-            ("Sambir Distribution", 49.5183, 23.1975),
-            ("Truskavets Center", 49.2785, 23.5050),
-            ("Kalush Station", 49.0275, 24.3600),
-            ("Ivano-Frankivsk Post", 48.9226, 24.7111),
-            ("Morshyn Aid Station", 49.1550, 23.8700),
+        
+        # Suppliers (Pickups)
+        suppliers = []
+        supplier_data = [
+            ("Alpha Steel Works", 50.40, 30.60),
+            ("Beta Construction Supplies", 50.50, 30.40),
+            ("Gamma Medical Logistics", 50.45, 30.30)
         ]
-
-        for name, lat, lon in dropoff_data:
-            dropoffs.append(Location.objects.create(
-                name=name,
-                location_type='dropoff',
-                latitude=lat,
-                longitude=lon
-            ))
-
-        # 3. Add Inventory to Depot
-        for material in materials:
-            Inventory.objects.create(
-                location=depot,
-                material=material,
-                quantity=10000.0  # Sufficient stock for testing
+        for name, lat, lng in supplier_data:
+            s = Location.objects.create(
+                name=name, latitude=lat, longitude=lng,
+                location_type='supplier',
+                service_time_sec=900,
+                time_window_start=28800, # 08:00
+                time_window_end=64800    # 18:00
             )
+            suppliers.append(s)
+            # Add inventory to suppliers
+            for mat in materials:
+                Inventory.objects.create(location=s, material=mat, quantity=500.0)
+
+        # Customers (Deliveries)
+        customers = []
+        customer_data = [
+            ("Residential Site A", 50.42, 30.55),
+            ("Office Complex B", 50.48, 30.45),
+            ("Hospital C", 50.44, 30.51),
+            ("Bridge Construction D", 50.41, 30.49),
+            ("School Site E", 50.46, 30.54)
+        ]
+        for name, lat, lng in customer_data:
+            c = Location.objects.create(
+                name=name, latitude=lat, longitude=lng,
+                location_type='customer',
+                service_time_sec=300,
+                time_window_start=32400, # 09:00
+                time_window_end=72000    # 20:00
+            )
+            customers.append(c)
+        
+        # 3. Add Hub Inventory
+        for mat in materials:
+            Inventory.objects.create(location=hub, material=mat, quantity=1000.0)
 
         # 4. Create Vehicles
         self.stdout.write('Creating vehicles...')
         vehicle_configs = [
-            ("Light Truck A", 50.0),
-            ("Medium Truck B", 100.0),
-            ("Heavy Carrier C", 150.0),
+            ("Heavy Truck 01", 50.0, 10000.0), # Volume, Weight
+            ("Medium Van 02", 20.0, 3500.0),
+            ("Service Truck 03", 30.0, 5000.0)
         ]
-        for name, cap in vehicle_configs:
-            Vehicle.objects.create(
-                name=name,
-                capacity=cap,
-                current_location=depot
+        vehicles = []
+        for name, vol, weight in vehicle_configs:
+            v = Vehicle.objects.create(
+                name=name, capacity=vol, weight_capacity=weight,
+                current_location=hub, start_depot=hub, end_depot=hub,
+                cost_per_km=1.5
             )
-
-        # 5. Create Orders
-        self.stdout.write('Creating orders...')
-        for i in range(10):
-            priority = 'normal'
-            if i < 2:
-                priority = 'critical'
-            elif i < 4:
-                priority = 'high'
+            vehicles.append(v)
             
-            order = Order.objects.create(
-                destination=random.choice(dropoffs),
-                priority=priority,
+        # 5. Create Orders (Pending)
+        self.stdout.write('Creating orders...')
+        priorities = ['normal', 'high', 'critical']
+        for i in range(8):
+            dest = random.choice(customers)
+            pickup = random.choice(suppliers)
+            mat = random.choice(materials)
+            qty = random.randint(1, 10)
+            
+            o = Order.objects.create(
+                destination=dest,
+                assigned_warehouse=pickup,
+                priority=random.choice(priorities),
+                weight=qty * 50.0, # 50kg per unit
+                time_window_start=36000, # 10:00
+                time_window_end=64800,   # 18:00
                 status='pending'
             )
+            OrderItem.objects.create(
+                order=o, material=mat, quantity=qty
+            )
 
-            # 1-2 Items per order
-            num_items = random.randint(1, 2)
-            for mat in random.sample(materials, num_items):
-                OrderItem.objects.create(
-                    order=order,
-                    material=mat,
-                    quantity=round(random.uniform(5.0, 25.0), 2)
-                )
-
-        self.stdout.write(self.style.SUCCESS('Successfully populated mock data:'))
-        self.stdout.write(f'- {Material.objects.count()} Materials created')
-        self.stdout.write(f'- {Location.objects.count()} Locations created (1 Warehouse, 7 Dropoffs)')
-        self.stdout.write(f'- {Vehicle.objects.count()} Vehicles created')
-        self.stdout.write(f'- {Order.objects.count()} Orders created (2 critical, 2 high, 6 normal)')
+        self.stdout.write(self.style.SUCCESS(f'Successfully populated V4 Mock Data:'))
+        self.stdout.write(f'- {Location.objects.count()} Locations')
+        self.stdout.write(f'- {Vehicle.objects.count()} Vehicles')
+        self.stdout.write(f'- {Order.objects.count()} Pending Orders')
