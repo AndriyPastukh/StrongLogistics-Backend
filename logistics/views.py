@@ -46,6 +46,32 @@ class LocationViewSet(viewsets.ModelViewSet):
             return Response(result)
         return Response({"error": "No stock found nearby"}, status=status.HTTP_404_NOT_FOUND)
 
+    @transaction.atomic
+    @action(detail=True, methods=['post'])
+    def create_task(self, request, pk=None):
+        """Creates a new Order for this location with material items."""
+        location = self.get_object()
+        items_data = request.data.get('items', {})
+        
+        if not items_data or not isinstance(items_data, dict):
+            return Response({"error": "Missing or invalid 'items' dictionary. Format: {'material_name': quantity}"}, 
+                             status=status.HTTP_400_BAD_REQUEST)
+
+        # Use default pickup location (the main warehouse/depot)
+        warehouse = Location.objects.filter(location_type='warehouse').first()
+
+        order = Order.objects.create(
+            destination=location,
+            assigned_warehouse=warehouse,
+            status='pending'
+        )
+        
+        for material_name, qty in items_data.items():
+            material, _ = Material.objects.get_or_create(name=material_name)
+            OrderItem.objects.create(order=order, material=material, quantity=float(qty))
+        
+        return Response(OrderSerializer(order).data, status=status.HTTP_201_CREATED)
+
 class InventoryViewSet(viewsets.ModelViewSet):
     queryset = Inventory.objects.all()
     serializer_class = InventorySerializer
@@ -69,6 +95,157 @@ class VehicleViewSet(viewsets.ModelViewSet):
         
         vehicle.save()
         return Response(self.get_serializer(vehicle).data)
+
+    @action(detail=True, methods=['post'])
+    def add_to_route(self, request, pk=None):
+        """Find a 'pending' order that has this pointId as a delivery location and assign it."""
+        vehicle = self.get_object()
+        point_id = request.data.get('pointId')
+        
+        if not point_id:
+            return Response({"error": "Missing 'pointId'"}, status=status.HTTP_400_BAD_REQUEST)
+            
+        try:
+            # Find an order that is pending and whose destination is the given pointId
+            order = Order.objects.filter(destination_id=point_id, status='pending').first()
+            if not order:
+                 return Response({"error": f"No pending order found for location ID {point_id}"}, 
+                                 status=status.HTTP_404_NOT_FOUND)
+
+            order.assigned_vehicle = vehicle
+            order.status = 'assigned'
+            order.save()
+            return Response({"status": "success", "order": OrderSerializer(order).data})
+        except Exception as e:
+            return Response({"status": "error", "message": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=['get', 'post'])
+    def get_optimized_route(self, request, pk=None):
+        """Returns sequence of points for assigned orders, including full Location data and materials."""
+        vehicle = self.get_object()
+        orders = Order.objects.filter(assigned_vehicle=vehicle, status='assigned')
+        
+        if not orders.exists():
+            return Response({"steps": [], "materials_summary": []})
+
+        from .services.routing import SolverLocation, SolverOrder, SolverVehicle, RouteOptimizer
+        
+        locations = Location.objects.all()
+        depot = vehicle.start_depot or Location.objects.filter(location_type='warehouse').first()
+
+        s_locations = [
+            SolverLocation(
+                id=loc.id, name=loc.name, lat=loc.latitude, lng=loc.longitude, 
+                type=loc.location_type, service_time_sec=loc.service_time_sec,
+                time_window_start=loc.time_window_start, time_window_end=loc.time_window_end
+            ) for loc in locations
+        ]
+        
+        s_vehicles = [
+            SolverVehicle(
+                id=vehicle.id, start_depot_id=depot.id if depot else 1,
+                end_depot_id=vehicle.end_depot.id if vehicle.end_depot else (depot.id if depot else 1),
+                capacity=vehicle.capacity, weight_capacity=vehicle.weight_capacity,
+                max_distance=500.0 # Enough range
+            )
+        ]
+        
+        s_orders = [
+            SolverOrder(
+                id=o.id, 
+                from_location_id=o.assigned_warehouse.id if o.assigned_warehouse else (depot.id if depot else 1),
+                to_location_id=o.destination.id,
+                volume=sum(item.quantity for item in o.items.all()),
+                weight=o.weight,
+                priority=3 if o.priority == 'critical' else (2 if o.priority == 'high' else 1)
+            ) for o in orders
+        ]
+
+        optimizer = RouteOptimizer(s_vehicles, s_orders, s_locations)
+        result = optimizer.optimize()
+
+        if 'routes' in result and len(result['routes']) > 0:
+            route_data = result['routes'][0]
+            # Enhance steps with full location objects and materials
+            enhanced_steps = []
+            for step in route_data['steps']:
+                 # Find the location model
+                 loc_name = step['location_name']
+                 loc_obj = Location.objects.filter(name=loc_name).first()
+                 
+                 step_info = {
+                     "location": LocationSerializer(loc_obj).data if loc_obj else step,
+                     "type": step['type'],
+                     "arrival_time_sec": step['arrival_time_sec']
+                 }
+                 
+                 if step.get('order_id'):
+                      order_obj = Order.objects.get(id=step['order_id'])
+                      step_info['items'] = OrderItemSerializer(order_obj.items.all(), many=True).data
+                      
+                 enhanced_steps.append(step_info)
+
+            return Response({
+                "vehicle_id": vehicle.id,
+                "steps": enhanced_steps,
+                "distance_meters": route_data['distance_meters']
+            })
+        
+        return Response(result)
+
+    @action(detail=True, methods=['post'])
+    def generate_route(self, request, pk=None):
+        """Specifically triggers optimization for this vehicle and pending orders, assigns them."""
+        vehicle = self.get_object()
+        pending_orders = Order.objects.filter(status='pending')
+        
+        if not pending_orders.exists():
+            return Response({"error": "No pending orders to assign"}, status=status.HTTP_404_NOT_FOUND)
+
+        from .services.routing import SolverLocation, SolverOrder, SolverVehicle, RouteOptimizer
+        
+        locations = Location.objects.all()
+        depot = vehicle.start_depot or Location.objects.filter(location_type='warehouse').first()
+
+        s_locations = [
+            SolverLocation(id=loc.id, name=loc.name, lat=loc.latitude, lng=loc.longitude, type=loc.location_type) 
+            for loc in locations
+        ]
+        s_vehicles = [
+            SolverVehicle(id=vehicle.id, start_depot_id=depot.id, end_depot_id=depot.id, 
+                          capacity=vehicle.capacity, weight_capacity=vehicle.weight_capacity, max_distance=300.0)
+        ]
+        s_orders = [
+            SolverOrder(id=o.id, from_location_id=o.assigned_warehouse.id if o.assigned_warehouse else depot.id, 
+                        to_location_id=o.destination.id, volume=sum(item.quantity for item in o.items.all()), weight=o.weight) 
+            for o in pending_orders
+        ]
+
+        optimizer = RouteOptimizer(s_vehicles, s_orders, s_locations)
+        result = optimizer.optimize()
+
+        if 'routes' in result and len(result['routes']) > 0:
+            assigned_count = 0
+            route_data = result['routes'][0]
+            for step in route_data['steps']:
+                if step.get('order_id') and step.get('type') == 'delivery':
+                    Order.objects.filter(id=step['order_id']).update(status='assigned', assigned_vehicle=vehicle)
+                    assigned_count += 1
+            
+            # Summary of materials to load
+            assigned_order_ids = [s['order_id'] for s in route_data['steps'] if s.get('order_id') and s.get('type') == 'delivery']
+            materials_sum = list(OrderItem.objects.filter(order__id__in=assigned_order_ids)
+                                .values('material__name')
+                                .annotate(total_qty=Sum('quantity')))
+            
+            return Response({
+                "status": "success",
+                "assigned_orders_count": assigned_count,
+                "materials_to_load": materials_sum,
+                "route_sequence": route_data['steps']
+            })
+        
+        return Response({"error": "Could not generate an optimal route for this driver"}, status=status.HTTP_400_BAD_REQUEST)
 
     @action(detail=True, methods=['get'])
     def download_route_manifest(self, request, pk=None):
